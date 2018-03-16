@@ -1,0 +1,165 @@
+<?php
+/**
+ * @file
+ * Install, update and uninstall functions for the Stripe module.
+ */
+
+/**
+ * Implements hook_requirements().
+ */
+function stripe_requirements($phase) {
+  $requirements = array();
+  if ($phase == 'runtime') {
+    $requirements['stripe'] = _stripe_requirement_check();
+  }
+  return $requirements;
+}
+
+/**
+ * Helper function to hook_requirements.
+ */
+function _stripe_requirement_check() {
+  $t = get_t();
+  if (($library = libraries_detect('stripe-php')) && !empty($library['installed'])) {
+    return array(
+      'title' => $t('Stripe Payment API PHP Library'),
+      'value' => $t('Stripe PHP Library is in place. Version @version', array('@version' => $library['version'])),
+      'severity' => REQUIREMENT_OK,
+    );
+  }
+  else {
+    return array(
+      'title' => $t('Stripe Payment API PHP Library'),
+      'value' => $t('The Stripe PHP Library is not in place. <a href="https://code.stripe.com/stripe-php-latest.zip">Download and unzip the library</a> then place the contents of that directory in sites/all/libraries/stripe-php'),
+      'severity' => REQUIREMENT_ERROR,
+    );
+  }
+}
+
+/**
+ * Implements hook_schema().
+ */
+function stripe_schema() {
+  // Table for logging webhook events.
+  // @see https://stripe.com/docs/api/php#idempotent_requests
+  $schema['stripe_webhook_events'] = array(
+    'description' => 'This table logs webhook events for idempotency.',
+    'fields' => array(
+      'event_id' => array(
+        'description' => 'The unique event_id of the received webhook.',
+        'type' => 'varchar',
+        'length' => 128,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'idempotency_key' => array(
+        'description' => 'The optional idempotency_key supplied to Stripe during a request.',
+        'type' => 'varchar',
+        'length' => 128,
+      ),
+      'type' => array(
+        'description' => 'The event type.',
+        'type' => 'varchar',
+        'length' => 64,
+      ),
+      'api_version' => array(
+        'description' => 'The version of Stripe API which generated this webhook.',
+        'type' => 'varchar',
+        'length' => 64,
+      ),
+      'created' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+        'description' => 'The timestamp when this webhook was created.',
+      ),
+      'received' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+        'description' => 'The timestamp when this webhook was received.',
+      ),
+      'livemode' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+        'description' => 'Whether this webhook was created in live or test mode.',
+      ),
+      'processed' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+        'description' => 'The timestamp when this webhook was processed.',
+      ),
+    ),
+    'primary key' => array('event_id'),
+    'indexes' => array(
+      'created' => array('created'),
+      'received' => array('received'),
+      'processed' => array('processed'),
+      'api_version' => array('api_version'),
+    ),
+  );
+  return $schema;
+}
+
+/**
+ * Rename Stripe PHP Library directory to stripe-php directory.
+ */
+function stripe_update_7100(&$sandbox) {
+  // Removed as not a best practice.
+}
+
+/**
+ * Install a webhook event database table for idempotency.
+ */
+function stripe_update_7101(&$sandbox) {
+  if (!db_table_exists('stripe_webhook_events')) {
+    $schema = drupal_get_schema_unprocessed('stripe', 'stripe_webhook_events');
+    db_create_table('stripe_webhook_events', $schema);
+  }
+}
+
+/**
+ * Convert `stripe_{set}_secret` and `stripe_{$set}_publishable` keys to a single set.
+ */
+function stripe_update_7102(&$sandbox) {
+  if (!empty(variable_get('stripe_test_secret', ''))) {
+    // Find out which status we are using.
+    $set = variable_get('stripe_key_status', 'test');
+
+    drupal_set_message(t('Using Stripe API key status: %set', array('%set' => $set)));
+
+    // Update values from our previous settings.
+    $secret = variable_get('stripe_' . $set . '_secret', '');
+
+    if (!empty($secret)) {
+      variable_set('stripe_secret', $secret);
+      drupal_set_message(t('Set secret key.'));
+      variable_del('stripe_test_secret');
+      variable_del('stripe_live_secret');
+      drupal_set_message(t('Deleted old secret keys'));
+    }
+
+    $publishable = variable_get('stripe_' . $set . '_publishable', '');
+    if (!empty($publishable)) {
+      variable_set('stripe_publishable', $publishable);
+      drupal_set_message(t('Set publishable key.'));
+      variable_del('stripe_test_publishable');
+      variable_del('stripe_live_publishable');
+      drupal_set_message(t('Deleted old publishable keys'));
+    }
+  }
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function stripe_uninstall() {
+  variable_del('stripe_log_webhooks');
+  variable_del('stripe_webhooks_idempotent');
+}

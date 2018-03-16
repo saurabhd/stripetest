@@ -1,0 +1,141 @@
+<?php
+
+/**
+ * @file
+ * Drupal install hooks.
+ */
+
+/**
+ * Implements hook_schema().
+ */
+function stripe_customer_schema() {
+  $schema['stripe_customers'] = array(
+    'description' => 'Stripe customer objects.',
+    'fields' => array(
+      'cid' => array(
+        'type' => 'serial',
+        'description' => 'Internal Customer ID',
+        'not null' => TRUE,
+      ),
+      'uid' => array(
+        'description' => 'User ID',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'customer_id' => array(
+        'description' => 'The Stripe Customer ID',
+        'type' => 'varchar',
+        'length' => 32,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'livemode' => array(
+        'description' => 'Boolean indicating whether the record came from live or test.',
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'created' => array(
+        'description' => 'Date the customer was created in Stripe.',
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'changed' => array(
+        'description' => 'Date this record was last synced with Stripe.',
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'default_source' => array(
+        'description' => 'The default source for this Customer',
+        'type' => 'varchar',
+        'length' => 32,
+        'not null' => FALSE,
+      ),
+      'currency' => array(
+        'description' => 'Currency for this Customer',
+        'type' => 'varchar',
+        'length' => 32,
+        'not null' => FALSE,
+      ),
+      'status' => array(
+        'description' => 'Whether this customer is active. Default is true.',
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 1,
+      ),
+    ),
+    'indexes' => array(
+      'customer_id' => array('livemode', 'customer_id', 'uid'),
+    ),
+    'primary key' => array('cid'),
+    'foreign keys' => array(
+      'uid' => array(
+        'table' => 'users',
+        'column' => array('uid' => 'uid'),
+      ),
+    ),
+  );
+
+  return $schema;
+}
+
+/**
+ * Try to import any existing customer_ids from other Stripe modules.
+ */
+function stripe_customer_install() {
+  // Subscriptions first, since that module required this one to run.
+  if (module_exists('stripe_subscription')) {
+    stripe_load_library();
+    $subs = db_query("SELECT * FROM {stripe_subscriptions}");
+    while ($sub = $subs->fetchObject()) {
+      $update = new stdClass();
+      $update->uid = $sub->uid;
+      $update->customer_id = $sub->customer_id;
+      $update->livemode = $sub->livemode;
+      $update->created = $sub->created;
+      $update->changed = $sub->last_sync;
+
+      // If the customer has been deleted, set status to FALSE.
+      // @todo: Do this by pinging Stripe API or queueing customer for resync.
+
+      drupal_write_record('stripe_customers', $update);
+    }
+  }
+
+  // If Commerce Stripe is configured for Card on file,
+  // import existing customers and cards.
+  if (module_exists('commerce_stripe') && module_exists('commerce_cardonfile')) {
+    module_load_include('module', 'commerce_stripe');
+    $livemode = tg_stripe_live();
+
+    if (_commerce_stripe_load_setting('cardonfile')) {
+      $cards = db_query("SELECT * FROM {commerce_cardonfile} WHERE payment_method = 'commerce_stripe'");
+      stripe_load_library();
+      while ($card = $cards->fetchObject()) {
+        try {
+          list($customer_id, $card_id) = explode('|', $card->remote_id);
+
+          $update = new stdClass();
+          $update->uid = $card->uid;
+          $update->customer_id = $customer_id;
+          $update->livemode = $livemode;
+          $update->default_source = $card_id;
+          $update->created = $card->created;
+          $update->status = TRUE;
+
+          // If the customer has been deleted, set status to FALSE.
+          // @todo: Do this by pinging Stripe API or queueing customer for resync.
+
+          drupal_write_record('stripe_customers', $update);
+        }
+        catch (Exception $e) {
+          // Fail silently?
+        }
+      }
+    }
+  }
+}

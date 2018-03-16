@@ -1,0 +1,343 @@
+<?php
+
+/**
+ * @file
+ * Provides integration with Stripe and Drupal Users as Customers.
+ */
+
+/**
+ * Define some constants for Stripe Customer properties.
+ */
+define('STRIPE_CUSTOMER_ACTIVE', 1);
+define('STRIPE_CUSTOMER_INACTIVE', 0);
+
+/**
+ * Implements hook_menu().
+ */
+function stripe_customer_menu() {
+  $items = array();
+  $items['admin/stripe/customer/%'] = array(
+    'title' => 'View Customer',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('stripe_customer_customer_view_form', 3),
+    'access arguments' => array('administer stripe customers'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'stripe_customer.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Rules integration access callback.
+ */
+function stripe_customer_rules_access($type, $name) {
+  if ($type == 'event' || $type == 'condition') {
+    return user_access('administer stripe customers');
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function stripe_customer_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'stripe_customer') . '/views',
+  );
+}
+
+/**
+ * Implements hook_permission().
+ */
+function stripe_customer_permission() {
+  return array(
+    'administer stripe customers' => array(
+      'title' => t('Administer Stripe customer data'),
+      'description' => t('Allows access to view Stripe customer data.'),
+    ),
+  );
+}
+
+/**
+ * Get a Customer object from Stripe based on a customer_id.
+ *
+ * @param string $customer_id
+ *   Known Stripe Customer ID value.
+ *
+ * @return \Stripe\Customer|bool
+ *   Customer object if successful, FALSE otherwise
+ */
+function stripe_get_customer($customer_id) {
+  $customer = _stripe_customer_retrieve($customer_id);
+  if ($customer instanceof \Stripe\Customer) {
+    return $customer;
+  }
+  else {
+    return FALSE;
+  }
+}
+
+
+/**
+ * Retrieve a Stripe Customer from a webhook event.
+ *
+ * @param $event
+ *   A safely-loaded \Stripe\Event.
+ *
+ * @return bool|\Stripe\Customer
+ *   A fully-loaded Stripe Customer if successful, FALSE otherwise.
+ */
+function stripe_customer_from_webhook($event) {
+  stripe_load_library();
+  if (!$event instanceof \Stripe\Event) {
+    $event = \Stripe\Event::retrieve($event->id);
+  }
+
+  if ($event->data->object->object == 'customer') {
+    $customer = stripe_get_customer($event->data->object);
+  }
+  else {
+    $customer = stripe_get_customer($event->data->object->customer);
+  }
+
+  return isset($customer) ? $customer : FALSE;
+}
+
+/**
+ * Create a new Stripe customer for a user, or return one if it already exists.
+ */
+function stripe_create_customer($user, $params = array()) {
+  // Ensure we have a fully-loaded user.
+  if (is_int($user)) {
+    $user = user_load($user);
+  }
+  else {
+    $user = user_load($user->uid);
+  }
+  if (isset($user->stripe_customer_id)) {
+    return _stripe_customer_retrieve($user->stripe_customer_id);
+  }
+  else {
+    return _stripe_customer_create($user, $params);
+  }
+}
+
+/**
+ * Wrapper around updating a customer object.
+ *
+ * @param \Stripe\Customer $customer
+ *   A Customer object that has been modified.
+ */
+function stripe_update_customer(\Stripe\Customer $customer) {
+  _stripe_customer_update($customer);
+}
+
+/**
+ * Create a new customer object on Stripe's servers for a Drupal account.
+ *
+ * @param object $account
+ *   The Drupal user we are creating a customer for.
+ *
+ * @return object
+ *   Instance of \Stripe\Customer
+ */
+function _stripe_customer_create($account, $extra = array()) {
+  stripe_load_library();
+
+  // Add properties to the Stripe customer and allow modules to add their own.
+  $params = module_invoke_all('stripe_customer_info', $account, $extra);
+
+  try {
+    $customer = \Stripe\Customer::create($params);
+
+    if ($customer instanceof \Stripe\Customer) {
+      // Save the newly-created customer's info before returning it.
+      $insert = new stdClass();
+      $insert->uid = $account->uid;
+      $insert->customer_id = $customer->id;
+      $insert->livemode = $customer->livemode;
+      $insert->created = $customer->created;
+      $insert->changed = REQUEST_TIME;
+      $insert->default_source = $customer->default_source;
+      $insert->currency = $customer->currency;
+      $saved = drupal_write_record('stripe_customers', $insert);
+
+      if ($saved !== FALSE) {
+        // Notify Rules that a customer has been created.
+        if (module_exists('rules')) {
+          rules_invoke_all('stripe_customer_created', $customer, $account);
+        }
+        return $customer;
+      }
+    }
+  }
+  catch (Exception $e) {
+    drupal_set_message(t('Could not create Customer. Reason: @error', array('@error' => $e->getMessage())), 'error');
+  }
+}
+
+/**
+ * Retrieve customer object from Stripe's servers.
+ *
+ * @param string $customer_id
+ *   The known Stripe Customer ID value.
+ *
+ * @return \Stripe\Customer
+ *   Customer object
+ */
+function _stripe_customer_retrieve($customer_id) {
+  stripe_load_library();
+
+  try {
+    // Create the Customer in Stripe.
+    $customer = \Stripe\Customer::retrieve($customer_id);
+
+    if ($customer) {
+      return $customer;
+    }
+  }
+  catch (Exception $e) {
+    drupal_set_message('Could not retrieve Customer. Reason: @error', array('@error' => $e->getMessage()));
+  }
+}
+
+/**
+ * Update a Stripe customer on Stripe's servers.
+ */
+function _stripe_customer_update(\Stripe\Customer $customer) {
+  try {
+    stripe_load_library();
+
+    // Load the user based on the uid associated with this customer ID.
+    $user = user_load(stripe_customer_get_uid($customer->id));
+
+    // Allow other modules to alter the parameters for this customer.
+    $properties = module_invoke_all('stripe_customer', $user);
+    if (!empty($properties)) {
+      foreach ($properties as $property => $value) {
+        $customer->{$property} = $value;
+      }
+    }
+
+    // Save it at Stripe and update our database record accordingly.
+    $customer->save();
+
+    // We don't need to update every value, just the relevant ones.
+    db_merge('stripe_customers')
+      ->key(array('uid' => $user->uid, 'customer_id' => $customer->id))
+      ->fields(array(
+        'uid' => $user->uid,
+        'changed' => REQUEST_TIME,
+        'default_source' => $customer->default_source,
+        'currency' => $customer->currency,
+      ))
+      ->execute();
+
+    // Notify Rules of this update event.
+    if (module_exists('rules')) {
+      rules_invoke_all('stripe_customer_updated', $customer, $user);
+    }
+  }
+  catch (\Stripe\Error\InvalidRequest $e) {
+    drupal_set_message(t('Could not update customer :id. Reason: :error', array(
+      ':id' => $customer->id,
+      ':error' => $e->getMessage(),
+    )), 'error');
+  }
+}
+
+/**
+ * Delete a Stripe customer and update its status in the database.
+ *
+ * @param string $customer_id
+ *   The known Stripe Customer ID.
+ *
+ * @return bool
+ *   If the customer was deleted, return TRUE.
+ */
+function _stripe_customer_delete($customer_id) {
+  stripe_load_library();
+  try {
+    $customer = _stripe_customer_retrieve($customer_id);
+    $customer->delete();
+
+    if (!empty($customer->deleted)) {
+      // Do not delete the customer from the database, but change its status.
+      // Deleted customers still exist on Stripe for historical purposes.
+      db_query("UPDATE {stripe_customers} set status = :deleted WHERE customer_id = :id",
+        array(':deleted' => STRIPE_CUSTOMER_INACTIVE, ':id' => $customer_id));
+
+      return TRUE;
+    }
+  }
+  catch (\Stripe\Error\InvalidRequest $e) {
+    drupal_set_message(t('There was an error deleting this customer: :error',
+      array(':error' => $e->getMessage())), 'error');
+  }
+}
+
+/**
+ * Retrieve a Stripe customer_id for a user, if available.
+ */
+function stripe_customer_get_id($account) {
+  if (is_numeric($account)) {
+    $account = user_load($account);
+  }
+  $livemode = stripe_customer_livemode();
+  $customer_id = db_query("SELECT customer_id FROM {stripe_customers} WHERE uid = :uid AND livemode = :livemode AND status <> :inactive",
+    array(
+      ':uid' => $account->uid,
+      ':livemode' => $livemode,
+      ':inactive' => STRIPE_CUSTOMER_INACTIVE))->fetchField();
+  return !empty($customer_id) ? $customer_id : FALSE;
+}
+
+/**
+ * Get a User ID associated with a Stripe Customer ID.
+ */
+function stripe_customer_get_uid($customer_id) {
+  $uid = db_query("SELECT uid FROM {stripe_customers} WHERE customer_id = :customer_id",
+    array(':customer_id' => $customer_id))->fetchField();
+
+  if ($uid <= 0) {
+    return FALSE;
+  }
+  return $uid;
+}
+
+/**
+ * Check for our current Stripe Live mode, and then
+ *   return an int value that the Database API can use.
+ *
+ * return int
+ */
+function stripe_customer_livemode() {
+  return !empty(tg_stripe_live()) ? 1 : 0;
+}
+
+/**
+ * Implements hook_stripe_customer().
+ *
+ * This hook allows other modules to add additional
+ *   data, such as business_vat_id or additional metadata
+ *   to Stripe Customer creation and update calls.
+ */
+function stripe_customer_stripe_customer_info($account, $extra) {
+  // Always include our defaults.
+  $properties['email'] = $account->mail;
+  $properties['description'] = t('Customer for @mail', array('@mail' => $account->mail));
+  $properties['metadata'] = array(
+    'Member since' => format_date($account->created, 'short'),
+    'Username' => $account->name,
+    'User ID' => $account->uid,
+  );
+
+  // If we were passed extra parameters, add those last.
+  if (!empty($extra)) {
+    foreach ($extra as $param => $value) {
+      $properties[$param] = $value;
+    }
+  }
+  return $properties;
+}
